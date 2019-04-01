@@ -1,0 +1,12 @@
+[package]
+name = "greyhound"
+version = "0.1.0"
+authors = ["Colin Reeder <colin@vpzom.click>"]
+edition = "2018"
+
+[dependencies]
+bb8-postgres = "0.3.0"
+hyper = "0.12.25"
+tokio = "0.1.18"
+futures = "0.1.25"
+http = "0.1.16"
