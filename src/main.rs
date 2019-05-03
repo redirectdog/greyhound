@@ -52,6 +52,16 @@ fn handle_internal_error(err: &dyn std::fmt::Debug) -> Error {
 
 type DbPool = bb8::Pool<bb8_postgres::PostgresConnectionManager<tokio_postgres::NoTls>>;
 
+lazy_static::lazy_static! {
+    static ref ALLOW_PROXY_ADDRESS: bool = match std::env::var("ALLOW_PROXY_ADDRESS").as_ref().map(|x| x.as_ref()) {
+        Ok("1") => true,
+        Ok("0") => false,
+        Err(std::env::VarError::NotPresent) => false,
+        Ok(_) => panic!("Invalid value for ALLOW_PROXY_ADDRESS"),
+        Err(other) => panic!("Failed to read env value: {:?}", other),
+    };
+}
+
 fn report_visit(
     id: i32,
     db_pool: DbPool,
@@ -64,7 +74,15 @@ fn report_visit(
         .get(hyper::header::USER_AGENT)
         .and_then(|value| value.to_str().ok())
         .map(|s| s.to_owned());
-    let ip_address = addr.ip();
+    let mut ip_address = addr.ip().to_string();
+
+    if *ALLOW_PROXY_ADDRESS == true {
+        if let Some(value) = req.headers().get("X-Forwarded-For") {
+            if let Ok(value) = value.to_str() {
+                ip_address = value.to_owned();
+            }
+        }
+    }
 
     db_pool.run(move |mut conn| {
         conn.prepare("INSERT INTO visits (redirect, tstamp, ip_address, user_agent, uri_path) VALUES ($1, localtimestamp, $2, $3, $4)")
