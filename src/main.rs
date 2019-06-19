@@ -136,7 +136,7 @@ fn handle_request(
                 .map_err(|err| handle_internal_error(&err))
                 .then(flatten_result)
                 .and_then(move |row| {
-                    let id = row.get(0);
+                    let id: i32 = row.get(0);
 
                     const ACME_CHALLENGE_PATH_PREFIX: &str = "/.well-known/acme-challenge/";
 
