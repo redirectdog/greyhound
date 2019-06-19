@@ -15,4 +15,4 @@ tokio-postgres = "0.4.0-rc.2"
 try_future = "0.1.3"
 lazy_static = "1.3.0"
 tokio-rustls = "0.9.3"
-blocking_future = { path = "../../blocking_future" }
+blocking_future = "0.1.0"
