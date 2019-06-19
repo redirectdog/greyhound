@@ -101,6 +101,7 @@ fn handle_request(
     db_pool: DbPool,
     ip_addr: std::net::SocketAddr,
 ) -> impl Future<Item = hyper::Response<hyper::Body>, Error = http::Error> + Send {
+    println!("handle_request");
     req.headers()
         .get(hyper::header::HOST)
         .cloned()
@@ -113,7 +114,7 @@ fn handle_request(
 
             db_pool
                 .run(move |mut conn| {
-                    conn.prepare("SELECT id, destination FROM redirects WHERE host=$1")
+                    conn.prepare("SELECT id, destination, acme_token FROM redirects WHERE host=$1")
                         .then(move |res| match res {
                             Ok(stmt) => conn
                                 .query(&stmt, &[&host])
@@ -127,31 +128,63 @@ fn handle_request(
                         })
                         .and_then(|(row, conn)| {
                             Ok((
-                                match row {
-                                    None => Err(Error::NoRedirectFound),
-                                    Some(row) => {
-                                        let id: i32 = row.get(0);
-                                        let destination: String = row.get(1);
-
-                                        Ok((id, destination))
-                                    }
-                                },
+                                row.ok_or(Error::NoRedirectFound),
                                 conn,
                             ))
                         })
                 })
                 .map_err(|err| handle_internal_error(&err))
                 .then(flatten_result)
-                .and_then(move |(id, destination)| {
+                .and_then(move |row| {
+                    let id = row.get(0);
+
+                    const ACME_CHALLENGE_PATH_PREFIX: &str = "/.well-known/acme-challenge/";
+
+                    let path = req.uri().path();
+                    if path.len() > ACME_CHALLENGE_PATH_PREFIX.len() {
+                        let req_token = &path[ACME_CHALLENGE_PATH_PREFIX.len()..];
+                        let known_token: String = row.get(2);
+
+                        if req_token == known_token {
+                            return futures::future::Either::B(db_pool.run(move |mut conn| {
+                                conn.prepare("SELECT acme_key_authorization FROM redirects WHERE id=$1")
+                                    .then(|res| tack_on(res, conn))
+                                    .and_then(move |(stmt, mut conn)| {
+                                        conn.query(&stmt, &[&id])
+                                            .into_future()
+                                            .map(|(row, _)| row)
+                                            .map_err(|(err, _)| err)
+                                            .then(|res| tack_on(res, conn))
+                                    })
+                            })
+                                                              .map_err(|err| handle_internal_error(&err))
+                                              .and_then(|row| {
+                                                  row.ok_or(Error::NoRedirectFound) // this shouldn't happen unless the redirect was deleted while being handled
+                                              })
+                                              .and_then(|row| {
+                                                  let body: String = row.get(0);
+
+                                                  hyper::Response::builder()
+                                                      .status(hyper::StatusCode::OK)
+                                                      .body(body.into())
+                                                      .map_err(|err| handle_internal_error(&err))
+                                              })
+                                              );
+                        }
+                    }
+
+                    let destination: String = row.get(1);
+
                     tokio::spawn(report_visit(id, db_pool, &req, ip_addr));
 
                     let body = format!("Redirecting to {}", destination);
 
-                    hyper::Response::builder()
+                    futures::future::Either::A(hyper::Response::builder()
                         .status(hyper::StatusCode::MOVED_PERMANENTLY)
                         .header(hyper::header::LOCATION, destination)
                         .body(body.into())
                         .map_err(|err| handle_internal_error(&err))
+                        .into_future())
                 })
                 .into()
         })
@@ -165,6 +198,10 @@ fn main() {
         .expect("Failed to parse port");
     let database_url = std::env::var("DATABASE_URL").expect("Missing DATABASE_URL");
 
+    let tls_port: Option<u16> = std::env::var("TLS_PORT")
+        .ok()
+        .map(|value| value.parse().expect("Failed to parse TLS port"));
+
     tokio::run(futures::lazy(move || {
         bb8::Pool::builder()
             .build(bb8_postgres::PostgresConnectionManager::new(
@@ -173,20 +210,145 @@ fn main() {
             ))
             .map_err(|err| panic!("Failed to connect to database: {:?}", err))
             .and_then(move |db_pool| {
-                hyper::Server::bind(&std::net::SocketAddr::from((
+                let make_service = {
+                    let db_pool = db_pool.clone();
+                    hyper::service::make_service_fn(
+                        move |addr_stream: &hyper::server::conn::AddrStream| {
+                            let db_pool = db_pool.clone();
+                            let ip_addr = addr_stream.remote_addr();
+                            hyper::service::service_fn(move |req| {
+                                handle_request(req, db_pool.clone(), ip_addr)
+                            })
+                        },
+                        )
+                };
+
+                let http_server = hyper::Server::bind(&std::net::SocketAddr::from((
                     std::net::Ipv6Addr::UNSPECIFIED,
                     port,
                 )))
-                .serve(hyper::service::make_service_fn(
-                    move |addr_stream: &hyper::server::conn::AddrStream| {
-                        let db_pool = db_pool.clone();
-                        let ip_addr = addr_stream.remote_addr();
-                        hyper::service::service_fn(move |req| {
-                            handle_request(req, db_pool.clone(), ip_addr)
+                .serve(make_service)
+                .map_err(|err| panic!("Server execution failed: {:?}", err));
+
+                let https_server = tls_port.map(|tls_port| {
+                    struct CertResolver {
+                        db_pool: DbPool,
+                    }
+
+                    impl CertResolver {
+                        pub fn new(db_pool: DbPool) -> Self {
+                            Self { db_pool }
+                        }
+                    }
+
+                    impl tokio_rustls::rustls::ResolvesServerCert for CertResolver {
+                        fn resolve(&self, server_name: Option<tokio_rustls::webpki::DNSNameRef>, _sigschemes: &[tokio_rustls::rustls::SignatureScheme]) -> Option<tokio_rustls::rustls::sign::CertifiedKey> {
+                            match server_name {
+                                None => None,
+                                Some(host) => {
+                                    // Unfortunately, this has to be synchronous because rustls
+                                    // itself doesn't do async.
+                                    let host_str: &str = host.into();
+                                    let row = self.db_pool.run(|mut conn| {
+                                        conn.prepare("SELECT tls_privkey, tls_cert FROM redirects WHERE host=$1")
+                                            .then(|res| tack_on(res, conn))
+                                            .and_then(|(stmt, mut conn)| {
+                                                conn.query(&stmt, &[&host_str])
+                                                    .into_future()
+                                                    .map(|(row, _)| row)
+                                                    .map_err(|(err, _)| err)
+                                                    .then(|res| tack_on(res, conn))
+                                            })
+                                    })
+                                    .map_err(|err| eprintln!("Failed retrieving TLS cert: {:?}", err))
+                                    .wait()
+                                        .ok()
+                                        .and_then(|x| x);
+
+                                    println!("row is {}, host is {}", row.is_some(), host_str);
+
+                                    row.and_then(|row| {
+                                        let privkey = {
+                                            let privkey: Option<Vec<u8>> = row.get(0);
+
+                                            let privkey = privkey.and_then(|privkey| {
+                                                tokio_rustls::rustls::internal::pemfile::pkcs8_private_keys(&mut &privkey[..])
+                                                    .map_err(|_| eprintln!("Failed to read TLS privkey for host {:?}", host))
+                                                    .ok()
+                                                    .and_then(|keys| keys.into_iter().next())
+                                            });
+
+                                            let privkey = privkey.and_then(|privkey| {
+                                                tokio_rustls::rustls::sign::RSASigningKey::new(&privkey)
+                                                    .map_err(|_| eprintln!("Failed to read TLS privkey (part 2) for host {:?}", host))
+                                                    .ok()
+                                            });
+
+                                            privkey.map(|privkey| -> std::sync::Arc<Box<dyn tokio_rustls::rustls::sign::SigningKey>> {
+                                                std::sync::Arc::new(Box::new(privkey))
+                                            })
+                                        };
+
+                                        let certs = {
+                                            let cert: Option<Vec<u8>> = row.get(1);
+
+                                            let certs = cert.and_then(|cert| {
+                                                tokio_rustls::rustls::internal::pemfile::certs(&mut &cert[..])
+                                                    .map_err(|_| eprintln!("Failed to read TLS cert for host {:?}", host))
+                                                    .ok()
+                                            });
+
+                                            certs
+                                        };
+
+                                        privkey.and_then(|privkey| {
+                                            certs.map(|certs| (privkey, certs))
+                                        })
+                                            .map(|(privkey, certs)| {
+                                                tokio_rustls::rustls::sign::CertifiedKey::new(certs, privkey)
+                                            })
+                                    })
+                                }
+                            }
+                        }
+                    }
+
+                    let mut tls_config = tokio_rustls::rustls::ServerConfig::new(tokio_rustls::rustls::NoClientAuth::new());
+                    tls_config.cert_resolver = std::sync::Arc::new(CertResolver::new(db_pool.clone()));
+
+                    let tls_acceptor: tokio_rustls::TlsAcceptor = std::sync::Arc::new(tls_config).into();
+                    tokio::net::TcpListener::bind(&std::net::SocketAddr::from((
+                                std::net::Ipv6Addr::UNSPECIFIED,
+                                tls_port
+                            )))
+                        .expect("Failed to initialize secure server")
+                        .incoming()
+                        .for_each(move |stream| {
+                            let tls_acceptor = tls_acceptor.clone();
+                            let ip_addr = stream.peer_addr()?;
+                            tokio::spawn(blocking_future::BlockingFuture::new(move || tls_acceptor.accept(stream).wait())
+                                         .map_err(|e| format!("Failed to accept TLS connection: {:?}", e))
+                                         .and_then(|x| x.map_err(|e| format!("Failed to accept TLS connection: {:?}", e)))
+                                         .map_err(|e| eprintln!("{}", e))
+                                         .and_then({
+                                             let db_pool = db_pool.clone();
+                                             move |stream| {
+                                                 hyper::server::conn::Http::new().serve_connection(stream, hyper::service::service_fn(move |req| {
+                                                     handle_request(req, db_pool.clone(), ip_addr)
+                                                 }))
+                                                 .map_err(|e| eprintln!("Failed serving TLS connection: {:?}", e))
+                                             }
+                                         }));
+
+                            Ok(())
                         })
-                    },
-                ))
-                .map_err(|err| panic!("Server execution failed: {:?}", err))
+                    .map_err(|err| panic!("Failed running TLS server: {:?}", err))
+                });
+
+                match https_server {
+                    None => futures::future::Either::A(http_server),
+                    Some(https_server) => futures::future::Either::B(http_server.join(https_server).map(|_| ()))
+                }
             })
     }))
 }
