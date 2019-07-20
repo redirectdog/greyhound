@@ -62,6 +62,11 @@ lazy_static::lazy_static! {
     };
 }
 
+#[derive(Clone)]
+struct Settings {
+    free_visits: i32,
+}
+
 fn report_visit(
     id: i32,
     db_pool: DbPool,
@@ -99,9 +104,13 @@ fn report_visit(
 fn handle_request(
     req: hyper::Request<hyper::Body>,
     db_pool: DbPool,
+    settings: &Settings,
     ip_addr: std::net::SocketAddr,
 ) -> impl Future<Item = hyper::Response<hyper::Body>, Error = http::Error> + Send {
     println!("handle_request");
+
+    let free_visits = settings.free_visits;
+
     req.headers()
         .get(hyper::header::HOST)
         .cloned()
@@ -114,7 +123,7 @@ fn handle_request(
 
             db_pool
                 .run(move |mut conn| {
-                    conn.prepare("SELECT id, destination, acme_token FROM redirects WHERE host=$1")
+                    conn.prepare("SELECT id, destination, acme_token, cache_visit_count_month, owner FROM redirects WHERE host=$1")
                         .then(move |res| match res {
                             Ok(stmt) => conn
                                 .query(&stmt, &[&host])
@@ -174,17 +183,51 @@ fn handle_request(
                     }
 
                     let destination: String = row.get(1);
+                    let visit_count_month: i32 = row.get(3);
+                    let owner: i32 = row.get(4);
 
-                    tokio::spawn(report_visit(id, db_pool, &req, ip_addr));
-
-                    let body = format!("Redirecting to {}", destination);
-
-                    futures::future::Either::A(hyper::Response::builder()
-                        .status(hyper::StatusCode::MOVED_PERMANENTLY)
-                        .header(hyper::header::LOCATION, destination)
-                        .body(body.into())
+                    futures::future::Either::A((if visit_count_month > free_visits {
+                        futures::future::Either::A(db_pool.run(move |mut conn| {
+                            conn.prepare("SELECT cache_visit_pool_remaining FROM users WHERE id=$1")
+                                .then(|res| tack_on(res, conn))
+                                .and_then(move |(stmt, mut conn)| {
+                                    conn.query(&stmt, &[&owner])
+                                        .into_future()
+                                        .map(|(row, _)| row)
+                                        .map_err(|(err, _)| err)
+                                        .then(|res| tack_on(res, conn))
+                                })
+                        })
                         .map_err(|err| handle_internal_error(&err))
-                        .into_future())
+                            .map(|row| {
+                                match row {
+                                    Some(row) => row.get::<_, i32>(0) > 0,
+                                    None => false,
+                                }
+                            }))
+                    } else {
+                        futures::future::Either::B(futures::future::ok(true))
+                    })
+                    .and_then(move |within_limits| {
+                        tokio::spawn(report_visit(id, db_pool, &req, ip_addr));
+
+                        (if within_limits {
+                            let body = format!("Redirecting to {}", destination);
+
+                            hyper::Response::builder()
+                                .status(hyper::StatusCode::MOVED_PERMANENTLY)
+                                .header(hyper::header::LOCATION, destination)
+                                .body(hyper::Body::from(body))
+                        } else {
+                            let body = format!("<!DOCTYPE html><html><head><title>Redirect</title></head><body><p>Use this link to continue to the destination:</p><p><a href=\"{0}\">{0}</a></p><p>The <a href=\"https://redirect.dog\">redirect.dog</a> user responsible for this redirect has exceeded their account limits, so this page is now shown.</p></body></html>", v_htmlescape::escape(&destination));
+
+                            hyper::Response::builder()
+                                .status(hyper::StatusCode::NON_AUTHORITATIVE_INFORMATION)
+                                .header(hyper::header::CONTENT_TYPE, "text/html")
+                                .body(hyper::Body::from(body))
+                        })
+                                .map_err(|err| handle_internal_error(&err))
+                    }))
                 })
                 .into()
         })
@@ -210,14 +253,41 @@ fn main() {
             ))
             .map_err(|err| panic!("Failed to connect to database: {:?}", err))
             .and_then(move |db_pool| {
+                db_pool.run(|mut conn| {
+                    conn.prepare("SELECT free_visits FROM settings LIMIT 1")
+                        .then(|res| tack_on(res, conn))
+                        .and_then(|(stmt, mut conn)| {
+                            conn.query(&stmt, &[])
+                                .into_future()
+                                .map(|(row, _)| row)
+                                .map_err(|(err, _)| err)
+                                .then(|res| tack_on(res, conn))
+                        })
+                })
+                .map_err(|err| panic!("Failed to fetch settings: {:?}", err))
+                    .map(|row| {
+                        match row {
+                            Some(row) => {
+                                Settings {
+                                    free_visits: row.get(0),
+                                }
+                            },
+                            None => panic!("Missing settings row")
+                        }
+                    })
+                .map(|settings| (settings, db_pool))
+            })
+        .and_then(move |(settings, db_pool)| {
                 let make_service = {
                     let db_pool = db_pool.clone();
+                    let settings = settings.clone();
                     hyper::service::make_service_fn(
                         move |addr_stream: &hyper::server::conn::AddrStream| {
                             let db_pool = db_pool.clone();
                             let ip_addr = addr_stream.remote_addr();
+                            let settings = settings.clone();
                             hyper::service::service_fn(move |req| {
-                                handle_request(req, db_pool.clone(), ip_addr)
+                                handle_request(req, db_pool.clone(), &settings, ip_addr)
                             })
                         },
                         )
@@ -330,9 +400,10 @@ fn main() {
                                          .map_err(|e| eprintln!("{}", e))
                                          .and_then({
                                              let db_pool = db_pool.clone();
+                                             let settings = settings.clone();
                                              move |stream| {
                                                  hyper::server::conn::Http::new().serve_connection(stream, hyper::service::service_fn(move |req| {
-                                                     handle_request(req, db_pool.clone(), ip_addr)
+                                                     handle_request(req, db_pool.clone(), &settings, ip_addr)
                                                  }))
                                                  .map_err(|e| eprintln!("Failed serving TLS connection: {:?}", e))
                                              }
