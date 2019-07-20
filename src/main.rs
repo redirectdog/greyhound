@@ -14,23 +14,23 @@ enum Error {
 
     NoRedirectFound,
 
-    InternalError,
+    Internal,
 }
 
 impl Error {
-    pub fn into_response(&self) -> Result<hyper::Response<hyper::Body>, http::Error> {
+    pub fn as_response(&self) -> Result<hyper::Response<hyper::Body>, http::Error> {
         hyper::Response::builder()
             .status(match self {
                 Error::NoHost | Error::InvalidHostValue => hyper::StatusCode::BAD_REQUEST,
                 Error::NoRedirectFound => hyper::StatusCode::NOT_FOUND,
-                Error::InternalError => hyper::StatusCode::INTERNAL_SERVER_ERROR,
+                Error::Internal => hyper::StatusCode::INTERNAL_SERVER_ERROR,
             })
             .body(
                 match self {
                     Error::NoHost => "Missing Host header",
                     Error::InvalidHostValue => "Invalid Host header",
                     Error::NoRedirectFound => "No redirect found for that host",
-                    Error::InternalError => "Internal Server Error",
+                    Error::Internal => "Internal Server Error",
                 }
                 .into(),
             )
@@ -47,7 +47,7 @@ fn flatten_result<T, E>(res: Result<Result<T, E>, E>) -> Result<T, E> {
 
 fn handle_internal_error(err: &dyn std::fmt::Debug) -> Error {
     eprintln!("Internal error: {:?}", err);
-    Error::InternalError
+    Error::Internal
 }
 
 type DbPool = bb8::Pool<bb8_postgres::PostgresConnectionManager<tokio_postgres::NoTls>>;
@@ -76,7 +76,7 @@ fn report_visit(
         .map(|s| s.to_owned());
     let mut ip_address = addr.ip().to_string();
 
-    if *ALLOW_PROXY_ADDRESS == true {
+    if *ALLOW_PROXY_ADDRESS {
         if let Some(value) = req.headers().get("X-Forwarded-For") {
             if let Ok(value) = value.to_str() {
                 ip_address = value.to_owned();
@@ -188,7 +188,7 @@ fn handle_request(
                 })
                 .into()
         })
-        .or_else(|err| err.into_response())
+        .or_else(|err| err.as_response())
 }
 
 fn main() {
@@ -292,13 +292,11 @@ fn main() {
                                         let certs = {
                                             let cert: Option<Vec<u8>> = row.get(1);
 
-                                            let certs = cert.and_then(|cert| {
+                                            cert.and_then(|cert| {
                                                 tokio_rustls::rustls::internal::pemfile::certs(&mut &cert[..])
                                                     .map_err(|_| eprintln!("Failed to read TLS cert for host {:?}", host))
                                                     .ok()
-                                            });
-
-                                            certs
+                                            })
                                         };
 
                                         privkey.and_then(|privkey| {
